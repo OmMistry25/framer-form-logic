@@ -2,7 +2,7 @@ import { kv } from "@vercel/kv";
 
 type Tier = "medium" | "large" | "unknown";
 
-const EMPLOYEE_LARGE_THRESHOLD = 500;
+const EMPLOYEE_LARGE_THRESHOLD = 4000;
 const CACHE_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 const FREE_EMAIL_DOMAINS = new Set([
