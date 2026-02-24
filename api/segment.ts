@@ -1,10 +1,9 @@
-import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { kv } from "@vercel/kv";
 
 type Tier = "medium" | "large" | "unknown";
 
-const EMPLOYEE_LARGE_THRESHOLD = 500; // change if needed
-const CACHE_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const EMPLOYEE_LARGE_THRESHOLD = 500;
+const CACHE_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 const FREE_EMAIL_DOMAINS = new Set([
   "gmail.com","googlemail.com","yahoo.com","hotmail.com","outlook.com","live.com","msn.com",
@@ -33,32 +32,34 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-/**
- * Apollo Organization Enrichment:
- * GET https://api.apollo.io/api/v1/organizations/enrich?domain=...
- * Auth: x-api-key header
- */
 async function apolloOrgEnrich(domain: string): Promise<{ employees?: number } | null> {
   const apiKey = process.env.APOLLO_API_KEY;
   if (!apiKey) return null;
 
-  const url = `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`;
-  const resp = await fetch(url, {
-    method: "GET",
-    headers: {
-      "accept": "application/json",
-      "cache-control": "no-cache",
-      "content-type": "application/json",
-      "x-api-key": apiKey
-    }
-  });
+  const start = Date.now();
 
-  if (!resp.ok) return null;
+  const resp = await fetch(
+    `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`,
+    {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        "cache-control": "no-cache",
+        "content-type": "application/json",
+        "x-api-key": apiKey
+      }
+    }
+  );
+
+  const latency = Date.now() - start;
+
+  if (!resp.ok) {
+    console.error("Apollo failed:", resp.status);
+    return null;
+  }
 
   const data: any = await resp.json();
 
-  // Apollo response shapes can vary; handle common patterns safely.
-  // We try a few likely fields:
   const employees =
     data?.organization?.estimated_num_employees ??
     data?.organization?.num_employees ??
@@ -68,11 +69,14 @@ async function apolloOrgEnrich(domain: string): Promise<{ employees?: number } |
     data?.employee_count;
 
   return {
-    employees: typeof employees === "number" ? employees : undefined
-  };
+    employees: typeof employees === "number" ? employees : undefined,
+    apolloLatencyMs: latency
+  } as any;
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
+  const requestStart = Date.now();
+
   if (req.method !== "POST") {
     res.status(405).json({ error: "POST only" });
     return;
@@ -87,41 +91,58 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (FREE_EMAIL_DOMAINS.has(domain)) {
-    res.status(200).json({ tier: "unknown", domain, reason: "free_email" });
+    res.status(200).json({
+      tier: "unknown",
+      domain,
+      source: "free_email",
+      totalLatencyMs: Date.now() - requestStart
+    });
     return;
   }
 
   const cacheKey = `seg:domain:${domain}`;
 
-  // 1) KV fast path
-  const cached = await kv.get<{ tier: Tier; employees?: number; updatedAt?: string }>(cacheKey);
+  const cached = await kv.get<any>(cacheKey);
   if (cached?.tier) {
     res.status(200).json({
       tier: cached.tier,
       domain,
       employees: cached.employees,
-      updatedAt: cached.updatedAt,
-      source: "kv"
+      source: "kv",
+      totalLatencyMs: Date.now() - requestStart
     });
     return;
   }
 
-  // 2) Apollo best-effort. Keep it short to respect the client’s 300ms budget.
-  // We target <= 250ms server-side so the client can still open within 300ms.
   try {
-    const enriched = await withTimeout(apolloOrgEnrich(domain), 1500);
+    const enriched: any = await withTimeout(apolloOrgEnrich(domain), 1500);
+
     const employees = enriched?.employees;
+    const apolloLatencyMs = enriched?.apolloLatencyMs ?? null;
+
     const tier = tierFromEmployees(employees);
 
-    // Cache even unknown to avoid hammering Apollo for junk domains (shorter TTL for unknown)
-    const ttl = tier === "unknown" ? 60 * 60 * 24 * 3 : CACHE_TTL_SECONDS; // 3 days for unknown
-    await kv.set(cacheKey, { tier, employees, updatedAt: new Date().toISOString() }, { ex: ttl });
+    await kv.set(
+      cacheKey,
+      { tier, employees, updatedAt: new Date().toISOString() },
+      { ex: CACHE_TTL_SECONDS }
+    );
 
-    res.status(200).json({ tier, domain, employees, source: "apollo" });
-    return;
+    res.status(200).json({
+      tier,
+      domain,
+      employees,
+      source: "apollo",
+      apolloLatencyMs,
+      totalLatencyMs: Date.now() - requestStart
+    });
+
   } catch {
-    // If Apollo is slow or fails, return unknown quickly. Client will default mid-market.
-    res.status(200).json({ tier: "unknown", domain, source: "timeout_or_error" });
-    return;
+    res.status(200).json({
+      tier: "unknown",
+      domain,
+      source: "timeout_or_error",
+      totalLatencyMs: Date.now() - requestStart
+    });
   }
 }
