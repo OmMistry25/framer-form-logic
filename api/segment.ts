@@ -109,7 +109,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 2) Apollo best-effort. Keep it short to respect the client’s 300ms budget.
   // We target <= 250ms server-side so the client can still open within 300ms.
   try {
-    const enriched = await withTimeout(apolloOrgEnrich(domain), 250);
+    const enriched = await withTimeout(apolloOrgEnrich(domain), 1500);
     const employees = enriched?.employees;
     const tier = tierFromEmployees(employees);
 
